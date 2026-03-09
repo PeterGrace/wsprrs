@@ -2,16 +2,20 @@
 
 A WSPR decoder daemon for [ka9q-radio](https://github.com/ka9q/ka9q-radio), written in Rust.
 
-`wsprrs` joins a ka9q-radio multicast group, buffers 2-minute IQ windows aligned to even UTC
-minutes, calls `wsprd` to decode WSPR spots, and emits each spot as a JSON object on stdout.
+`wsprrs` joins a ka9q-radio multicast group, listens to the status stream to discover active
+mono USB-audio channels, buffers 2-minute PCM windows aligned to even UTC minutes, and runs
+`wsprd` on each window.  Decoded spots are emitted as structured JSON via `tracing` and
+optionally appended to an NDJSON file.  All bands decode in parallel — one independent
+`wsprd` process per sealed window — so a 20-band setup decodes all bands simultaneously
+rather than sequentially.
 
 ---
 
 ## Requirements
 
-- A running `ka9q-radio` instance publishing an IQ stream over multicast UDP/RTP
-- [`wsprd`](https://physics.princeton.edu/pulsar/K1JT/wsjtx.html) on your `PATH` (or configured
-  via `WSPR_WSPRD_PATH`)
+- A running `ka9q-radio` instance publishing audio over multicast UDP/RTP
+- [`wsprd`](https://wsjt.sourceforge.io/wsjtx.html) (WSJT-X 2.5+) on your `PATH` or
+  configured via `WSPR_WSPRD_PATH`
 - Rust 2021 edition toolchain (`cargo build --release`)
 
 ---
@@ -28,19 +32,21 @@ The binary is placed at `target/release/wsprrs`.
 
 ## Configuration
 
-All settings are read from environment variables. A `.env` file in the working directory is loaded
-automatically if present.
+All settings are read from environment variables.  A `.env` file in the working directory is
+loaded automatically if present.
 
-| Variable               | Required | Default   | Description                                                    |
-|------------------------|----------|-----------|----------------------------------------------------------------|
-| `WSPR_MULTICAST_ADDR`  | yes      | —         | Multicast group IP address (e.g. `239.1.2.3`)                  |
-| `WSPR_MULTICAST_PORT`  | yes      | —         | UDP port for the RTP data stream (e.g. `5004`)                 |
-| `WSPR_STATUS_PORT`     | no       | `5006`    | UDP port for the ka9q-radio status stream                      |
-| `WSPR_LOCAL_ADDR`      | no       | `0.0.0.0` | Local interface address to bind and join the multicast group   |
-| `WSPR_SSRC`            | no       | (all IQ)  | Hex SSRC to track exclusively (e.g. `0x0AE2B400`); omit to track all stereo-IQ SSRCs |
-| `WSPR_CAPTURE_SECONDS` | no       | `116`     | Window length in seconds; must be >= 111                       |
-| `WSPR_TEMP_DIR`        | no       | `/tmp`    | Directory for temporary `.c2` files passed to `wsprd`          |
-| `WSPR_WSPRD_PATH`      | no       | `wsprd`   | Path or name of the `wsprd` binary                             |
+| Variable               | Required | Default              | Description |
+|------------------------|----------|----------------------|-------------|
+| `WSPR_MULTICAST_ADDR`  | yes      | —                    | Multicast group IP (e.g. `239.1.2.3`) |
+| `WSPR_MULTICAST_PORT`  | yes      | —                    | UDP port for the RTP audio stream (e.g. `5004`) |
+| `WSPR_STATUS_PORT`     | no       | `5006`               | UDP port for the ka9q-radio status stream |
+| `WSPR_LOCAL_ADDR`      | no       | `0.0.0.0`            | Local interface address for multicast joins |
+| `WSPR_SSRC`            | no       | (all mono channels)  | Hex SSRC to track exclusively (e.g. `0x36FA`); omit to track all |
+| `WSPR_CAPTURE_SECONDS` | no       | `116`                | Window length in seconds; must be ≥ 111 |
+| `WSPR_TEMP_DIR`        | no       | `/tmp`               | Directory for per-decode temporary subdirectories |
+| `WSPR_WSPRD_PATH`      | no       | `wsprd`              | Path or name of the `wsprd` binary |
+| `WSPR_OUTPUT_FILE`     | no       | (none)               | Path to append decoded spots as NDJSON (one JSON object per line) |
+| `WSPR_WISDOM_FILE`     | no       | `wspr_wisdom.dat`    | Path to the FFTW wisdom file (see [FFTW Wisdom](#fftw-wisdom)) |
 
 ### Example `.env`
 
@@ -50,6 +56,7 @@ WSPR_MULTICAST_PORT=5004
 WSPR_STATUS_PORT=5006
 WSPR_LOCAL_ADDR=192.168.1.10
 WSPR_WSPRD_PATH=/usr/local/bin/wsprd
+WSPR_OUTPUT_FILE=/var/log/wspr/spots.ndjson
 ```
 
 ---
@@ -64,14 +71,15 @@ WSPR_WSPRD_PATH=/usr/local/bin/wsprd
 WSPR_MULTICAST_ADDR=239.1.2.3 WSPR_MULTICAST_PORT=5004 ./target/release/wsprrs
 ```
 
-Log verbosity is controlled by the standard `RUST_LOG` environment variable:
+Log verbosity is controlled by the `RUST_LOG` environment variable:
 
 ```sh
-RUST_LOG=debug ./target/release/wsprrs   # verbose
-RUST_LOG=warn  ./target/release/wsprrs   # quiet
+RUST_LOG=info  ./target/release/wsprrs   # default — spot events + window lifecycle
+RUST_LOG=debug ./target/release/wsprrs   # verbose — includes per-packet traces
+RUST_LOG=warn  ./target/release/wsprrs   # quiet — errors and warnings only
 ```
 
-Press `Ctrl-C` to trigger a clean shutdown.
+Press `Ctrl-C` for a clean shutdown.
 
 ---
 
@@ -79,125 +87,139 @@ Press `Ctrl-C` to trigger a clean shutdown.
 
 `wsprrs` runs four concurrent async tasks:
 
-1. **recv_task** — reads raw UDP datagrams from the RTP data port and passes them to the buffer task.
-2. **status_task** — listens on the status port; parses per-SSRC TLV metadata (centre frequency,
-   sample rate, encoding, channel count) emitted by ka9q-radio.
-3. **buffer_task** — parses RTP headers, filters for stereo IQ streams (channels == 2), ingests
-   S16BE samples into per-SSRC `IqWindow` ring buffers aligned to even UTC minute boundaries, and
-   seals each window after `WSPR_CAPTURE_SECONDS` seconds.
-4. **decode_task** — receives sealed windows, writes a `.c2` file to `WSPR_TEMP_DIR`, invokes
-   `wsprd` as a subprocess, parses its output, and logs each decoded spot as JSON.
+1. **recv_task** — reads raw UDP datagrams from the RTP audio port and forwards them to the
+   buffer task via an in-process channel.
 
-Centre frequency and sample rate are never hard-coded; they are discovered per-SSRC from the
-ka9q-radio status stream.
+2. **status_task** — listens on the ka9q-radio status port; parses per-SSRC TLV metadata
+   (centre frequency, sample rate, encoding, channel count).  Only mono USB-audio channels
+   (`channels == 1`) are eligible for buffering — this is the standard WSPR output mode in
+   ka9q-radio.
+
+3. **buffer_task** — parses RTP headers, looks up each SSRC in the status map, ingests S16BE
+   PCM samples into per-SSRC `AudioWindow` buffers aligned to even UTC minute boundaries, and
+   seals each window when it reaches `WSPR_CAPTURE_SECONDS` seconds.  Centre frequency and
+   sample rate come from the status stream; nothing is hard-coded.
+
+4. **decode_task** — receives sealed windows.  Each window is dispatched to its own
+   `tokio::spawn`ed task, so all bands decode concurrently.  Each task:
+   - Creates an isolated temporary subdirectory under `WSPR_TEMP_DIR`
+   - Copies `wspr_wisdom.dat` in (if available) to skip FFTW planning
+   - Writes a standard RIFF/WAV file
+   - Runs `wsprd -f <dial_MHz> wspr.wav` in that subdirectory
+   - Reads `ALL_WSPR.TXT` for the full decode-quality field set
+   - Copies `wspr_wisdom.dat` back out if this was the first run
+   - Cleans up the temporary subdirectory
+
+   Spot results flow back to the main decode loop via a channel for serialised file I/O.
 
 ---
 
-## Expected Output
+## FFTW Wisdom
 
-### Startup
+`wsprd` uses FFTW internally for its FFT computations.  After computing the optimal FFT plan
+for the host CPU, it saves a `wspr_wisdom.dat` file in its working directory.  Subsequent
+runs that find this file skip the planning step, which can save several seconds per decode.
+
+`wsprrs` manages this automatically:
+
+- **First run**: no wisdom file exists; `wsprd` computes and saves it; `wsprrs` copies it to
+  `WSPR_WISDOM_FILE` for future use.
+- **Subsequent runs**: `wsprrs` copies the wisdom file into each decode's temp subdirectory
+  before `wsprd` starts.
+
+The copy-out step uses an atomic rename, so concurrent decode tasks racing on the first run
+are safe — FFTW wisdom is deterministic for a given CPU, so all tasks produce identical
+content.
+
+---
+
+## Output
+
+### Progress bars
+
+While each 2-minute window is filling, a live progress bar is displayed per active channel:
 
 ```
-2026-03-09T02:01:00.123456Z  INFO wsprrs starting src/main.rs:84
-2026-03-09T02:01:00.124Z     INFO configuration loaded multicast=239.1.2.3 data_port=5004 status_port=5006 ssrc_filter=None
-2026-03-09T02:01:00.125Z     INFO joined multicast group 239.1.2.3:5004 (data)
-2026-03-09T02:01:00.125Z     INFO joined multicast group 239.1.2.3:5006 (status)
+SSRC 0x000036fa (14.0740 MHz) [===================>     ] 1044480/1392000 samples (75.0%) 75.0%
 ```
 
-### While Buffering
-
-A progress bar per active IQ stream is displayed on stderr while each 2-minute window fills:
+### Log events
 
 ```
-SSRC 0x0ae2b400 (14.097 MHz) [===================>     ] 221184/288000 samples (76.8%) 76.8%
+INFO new audio window opened ssrc=14074 freq_hz=14074000 sample_rate=12000
+INFO sealing audio window for decode ssrc=14074 samples_written=1391820 gap_count=0
+INFO wsprd: no spots decoded in this window
+INFO spot={"time_utc":"1106",...} WSPR spot decoded
 ```
 
-The SSRC prefix encodes the centre frequency in MHz, matching the ka9q-radio convention where
-`ssrc * 1e-6 = MHz`.
+### Decoded spots
 
-Log lines accompany each window lifecycle event:
-
-```
-INFO new IQ window opened ssrc=183058432 freq_hz=14097000 sample_rate=12000
-INFO sealing IQ window for decode ssrc=183058432 samples_written=288000 gap_count=0
-```
-
-### Decoded Spots
-
-Each decoded spot is emitted as a single JSON object on a `tracing::info!` line:
+Each spot is logged via `tracing::info!` and, if `WSPR_OUTPUT_FILE` is set, appended as a
+single JSON line to that file.  Example spot (pretty-printed):
 
 ```json
 {
-  "time_utc": "0200",
+  "time_utc": "1106",
   "snr_db": -14,
-  "dt_sec": 0.4,
-  "freq_hz": 14097042.7,
-  "message": "K1ABC FN42 33",
-  "grid": "FN42",
-  "power_dbm": 33,
+  "dt_sec": -0.23,
+  "freq_hz": 3570071.2,
+  "message": "W3POG FN20 23",
+  "grid": "FN20",
+  "power_dbm": 23,
   "drift": 0,
-  "decode_cycles": 3,
-  "jitter": 2
+  "sync_quality": 0.76,
+  "npass": 1,
+  "osd_pass": 1,
+  "nhardmin": 0,
+  "decode_cycles": 50,
+  "candidates": 37,
+  "nfano": -85
 }
 ```
 
-The raw log line looks like:
+### Spot field reference
 
-```
-2026-03-09T02:02:02.001Z  INFO spot={"time_utc":"0200","snr_db":-14,...} WSPR spot decoded
-```
+| Field           | Type    | Source          | Description |
+|-----------------|---------|-----------------|-------------|
+| `time_utc`      | string  | derived         | UTC start of the WSPR window, `HHMM` |
+| `snr_db`        | integer | ALL_WSPR.TXT    | Signal-to-noise ratio (dB re 2.5 kHz bandwidth) |
+| `dt_sec`        | float   | ALL_WSPR.TXT    | Time offset from nominal window start (seconds) |
+| `freq_hz`       | float   | ALL_WSPR.TXT    | Decoded carrier frequency (Hz) |
+| `message`       | string  | derived         | Full WSPR message, e.g. `"K1ABC FN42 33"` |
+| `grid`          | string  | ALL_WSPR.TXT    | Maidenhead locator, 4 or 6 characters; empty for type-2 messages |
+| `power_dbm`     | integer | ALL_WSPR.TXT    | Transmitted power (dBm) |
+| `drift`         | integer | ALL_WSPR.TXT    | Frequency drift (Hz/minute) |
+| `sync_quality`  | float   | ALL_WSPR.TXT    | Sync vector quality (0–1); higher = cleaner lock |
+| `npass`         | integer | ALL_WSPR.TXT    | Decode passes needed (1 = direct; 3 = required OSD) |
+| `osd_pass`      | integer | ALL_WSPR.TXT    | OSD pass on which the decode succeeded |
+| `nhardmin`      | integer | ALL_WSPR.TXT    | Minimum hard-decision count; more negative = more marginal |
+| `decode_cycles` | integer | ALL_WSPR.TXT    | Decoder iterations used; higher = more effort required |
+| `candidates`    | integer | ALL_WSPR.TXT    | Candidate messages explored; high values indicate a weak/noisy decode |
+| `nfano`         | integer | ALL_WSPR.TXT    | Fano metric; large magnitude = strong clean decode |
 
-When no spots are decoded in a window:
+**WSPR message types:**
+- **Type 1** (standard): `<callsign> <grid4> <power>` — e.g. `K1ABC FN42 33`
+- **Type 2** (no grid): `<callsign/prefix> <power>` — grid field is empty
+- **Type 3** (hash): `<...> <grid6> <power>` — 6-character grid with compressed callsign hash
 
-```
-INFO wsprd: no spots decoded in this window
-```
-
-### Shutdown
-
-```
-INFO Ctrl-C received; shutting down
-INFO buffer_task: shutdown signal received
-INFO decode_task: shutdown signal received
-INFO wsprrs stopped
-```
-
----
-
-## Spot JSON Field Reference
-
-| Field           | Type    | Description                                              |
-|-----------------|---------|----------------------------------------------------------|
-| `time_utc`      | string  | UTC time of transmission as `HHMM`                       |
-| `snr_db`        | integer | Signal-to-noise ratio (dB re 2.5 kHz bandwidth)          |
-| `dt_sec`        | float   | Time offset from nominal window start (seconds)          |
-| `freq_hz`       | float   | Decoded carrier frequency (Hz)                           |
-| `message`       | string  | Full WSPR message, e.g. `"K1ABC FN42 33"`                |
-| `grid`          | string  | Maidenhead grid locator extracted from the message       |
-| `power_dbm`     | integer | Transmitted power (dBm)                                  |
-| `drift`         | integer | Frequency drift (Hz/minute)                              |
-| `decode_cycles` | integer | Number of decoder correlation cycles used                |
-| `jitter`        | integer | Decoder jitter metric                                    |
-
----
-
-## Logging Spots to a File
-
-Because spots are written via `tracing::info!`, you can redirect or tee them independently:
+### Querying the NDJSON file
 
 ```sh
-# Append all spot JSON lines to a file while still watching the terminal
-./target/release/wsprrs 2>&1 | tee -a spots.log
+# All unique callsigns heard
+jq -r '.message | split(" ")[0]' spots.ndjson | sort -u
 
-# Extract only spot JSON with jq
-./target/release/wsprrs 2>&1 | grep 'WSPR spot decoded' | sed 's/.*spot=\(.*\) WSPR.*/\1/' | jq .
+# Spots sorted by SNR
+jq -s 'sort_by(.snr_db) | reverse | .[]' spots.ndjson
+
+# Count spots per band (by frequency bucket)
+jq -r '.freq_hz / 1e6 | floor' spots.ndjson | sort | uniq -c
 ```
 
 ---
 
 ## Tokio Console
 
-`wsprrs` is instrumented for [tokio-console](https://github.com/tokio-rs/console). Start the
+`wsprrs` is instrumented for [tokio-console](https://github.com/tokio-rs/console).  Start the
 console in a separate terminal to inspect async task scheduling in real time:
 
 ```sh
@@ -208,4 +230,4 @@ tokio-console
 
 ## License
 
-See `Cargo.toml` for author information. No explicit license file is included at this time.
+See `Cargo.toml` for author information.  No explicit license file is included at this time.
