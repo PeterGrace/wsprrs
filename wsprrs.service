@@ -1,0 +1,25 @@
+[Unit]
+Description=WSPR decoder helper
+Documentation=https://github.com/PeterGrace/wsprrs
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/wsprrs
+EnvironmentFile=/etc/wsprrs/env
+ExecStart=/usr/local/bin/wsprrs
+Restart=on-failure
+RestartSec=10
+
+# Log verbosity — adjust via RUST_LOG in EnvironmentFile if needed.
+# Defaults to "info" when RUST_LOG is unset.
+Environment=RUST_LOG=info
+
+# Journal output — view with: journalctl -u wsprrs -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wsprrs
+
+[Install]
+WantedBy=multi-user.target

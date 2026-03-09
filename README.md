@@ -37,7 +37,7 @@ loaded automatically if present.
 
 | Variable               | Required | Default              | Description |
 |------------------------|----------|----------------------|-------------|
-| `WSPR_MULTICAST_ADDR`  | yes      | —                    | Multicast group IP (e.g. `239.1.2.3`) |
+| `WSPR_MULTICAST_ADDR`  | yes      | —                    | Multicast group IP or hostname (e.g. `239.1.2.3`, `radio.local`) — `.local` mDNS names are resolved via the OS resolver (Avahi/`nss-mdns`) |
 | `WSPR_MULTICAST_PORT`  | yes      | —                    | UDP port for the RTP audio stream (e.g. `5004`) |
 | `WSPR_STATUS_PORT`     | no       | `5006`               | UDP port for the ka9q-radio status stream |
 | `WSPR_LOCAL_ADDR`      | no       | `0.0.0.0`            | Local interface address for multicast joins |
@@ -47,6 +47,7 @@ loaded automatically if present.
 | `WSPR_WSPRD_PATH`      | no       | `wsprd`              | Path or name of the `wsprd` binary |
 | `WSPR_OUTPUT_FILE`     | no       | (none)               | Path to append decoded spots as NDJSON (one JSON object per line) |
 | `WSPR_WISDOM_FILE`     | no       | `wspr_wisdom.dat`    | Path to the FFTW wisdom file (see [FFTW Wisdom](#fftw-wisdom)) |
+| `WSPR_QUIET`           | no       | (auto)               | Set to `1` to suppress progress bars; auto-detected when stderr is not a TTY |
 
 ### Example `.env`
 
@@ -213,6 +214,66 @@ jq -s 'sort_by(.snr_db) | reverse | .[]' spots.ndjson
 
 # Count spots per band (by frequency bucket)
 jq -r '.freq_hz / 1e6 | floor' spots.ndjson | sort | uniq -c
+```
+
+---
+
+## Running as a systemd Service
+
+A sample unit file `wsprrs.service` is included in the repository.
+
+### Installation
+
+```sh
+# 1. Build the release binary
+cargo build --release
+
+# 2. Install the binary
+sudo cp target/release/wsprrs /usr/local/bin/
+
+# 3. Create a dedicated user and config directory
+sudo useradd --system --no-create-home wsprrs
+sudo mkdir -p /etc/wsprrs
+sudo cp wsprrs.service /etc/systemd/system/
+
+# 4. Write configuration
+sudo tee /etc/wsprrs/.env <<'EOF'
+WSPR_MULTICAST_ADDR=239.1.2.3
+WSPR_MULTICAST_PORT=5004
+WSPR_WSPRD_PATH=/usr/local/bin/wsprd
+WSPR_OUTPUT_FILE=/var/log/wspr/spots.ndjson
+RUST_LOG=info
+EOF
+sudo chown -R wsprrs:wsprrs /etc/wsprrs
+
+# 5. Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable --now wsprrs
+```
+
+### Quiet mode
+
+When stderr is not a TTY — which is always the case under systemd — `wsprrs`
+automatically enters **quiet mode**:
+
+- Progress bars are suppressed (draw target set to hidden; all bar calls
+  become no-ops with no CPU overhead).
+- Tracing output is written directly to `stderr` with ANSI escape codes
+  disabled so `journald` receives clean plain text.
+
+You can also force quiet mode in a terminal with `WSPR_QUIET=1`.
+
+### Viewing logs
+
+```sh
+# Follow live
+journalctl -u wsprrs -f
+
+# Spot events only
+journalctl -u wsprrs -f -g 'WSPR spot decoded'
+
+# Errors and warnings
+journalctl -u wsprrs -p warning
 ```
 
 ---

@@ -1,6 +1,38 @@
 use anyhow::{Context, Result};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
 use std::path::PathBuf;
+
+/// Resolve a string to an [`IpAddr`], accepting either a literal IP address
+/// or a hostname (including `.local` mDNS names via the OS resolver / Avahi).
+///
+/// # How it works
+///
+/// 1. Fast path: try to parse `s` directly as an IP address literal — no
+///    syscall needed.
+/// 2. Slow path: call the OS `getaddrinfo(3)` resolver via
+///    [`ToSocketAddrs`](std::net::ToSocketAddrs).  On Linux with `nss-mdns`
+///    installed, this transparently resolves `.local` Avahi-registered names.
+///
+/// # Errors
+///
+/// Returns an error if the string is neither a valid IP literal nor a name
+/// that the OS resolver can resolve, or if the name resolves to no addresses.
+fn resolve_host(s: &str) -> Result<IpAddr> {
+    // Fast path: plain IP literal ("239.1.2.3", "::1", etc.)
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Ok(ip);
+    }
+
+    // Slow path: hand off to the OS resolver.  `ToSocketAddrs` requires a
+    // port in the tuple, but we only need the IP — port 0 is a harmless
+    // placeholder.
+    (s, 0u16)
+        .to_socket_addrs()
+        .with_context(|| format!("could not resolve host {:?}", s))?
+        .map(|sa| sa.ip())
+        .next()
+        .with_context(|| format!("{:?} resolved to no addresses", s))
+}
 
 /// Runtime configuration loaded from environment / `.env`.
 ///
@@ -55,7 +87,7 @@ impl Config {
     /// Load configuration from environment variables.
     ///
     /// # Required variables
-    /// * `WSPR_MULTICAST_ADDR`  — multicast group IP
+    /// * `WSPR_MULTICAST_ADDR`  — multicast group IP or resolvable hostname (including `.local` mDNS)
     /// * `WSPR_MULTICAST_PORT`  — UDP port for the RTP data stream
     ///
     /// # Optional variables
@@ -73,10 +105,10 @@ impl Config {
     /// Returns an error if any required variable is missing or any value
     /// cannot be parsed.
     pub fn from_env() -> Result<Self> {
-        let multicast_addr: IpAddr = std::env::var("WSPR_MULTICAST_ADDR")
-            .context("WSPR_MULTICAST_ADDR not set")?
-            .parse()
-            .context("WSPR_MULTICAST_ADDR is not a valid IP address")?;
+        let multicast_addr = resolve_host(
+            &std::env::var("WSPR_MULTICAST_ADDR").context("WSPR_MULTICAST_ADDR not set")?,
+        )
+        .context("WSPR_MULTICAST_ADDR is not a valid IP address or resolvable hostname")?;
 
         let multicast_port: u16 = std::env::var("WSPR_MULTICAST_PORT")
             .context("WSPR_MULTICAST_PORT not set")?
@@ -170,6 +202,8 @@ mod tests {
             "WSPR_CAPTURE_SECONDS",
             "WSPR_TEMP_DIR",
             "WSPR_WSPRD_PATH",
+            "WSPR_OUTPUT_FILE",
+            "WSPR_WISDOM_FILE",
         ] {
             std::env::remove_var(name);
         }
@@ -248,5 +282,34 @@ mod tests {
 
         // Assert
         assert!(result.is_err(), "expected error for capture_seconds < 111");
+    }
+
+    // ── resolve_host unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_host_accepts_ipv4_literal() {
+        let ip = resolve_host("239.1.2.3").expect("should parse IPv4 literal");
+        assert_eq!(ip.to_string(), "239.1.2.3");
+    }
+
+    #[test]
+    fn resolve_host_accepts_ipv6_literal() {
+        let ip = resolve_host("::1").expect("should parse IPv6 literal");
+        assert!(ip.is_loopback());
+    }
+
+    #[test]
+    fn resolve_host_resolves_localhost() {
+        // "localhost" must resolve on every reasonable OS; confirms the
+        // getaddrinfo code path works.
+        let ip = resolve_host("localhost").expect("localhost should resolve");
+        assert!(ip.is_loopback(), "localhost should be a loopback address, got {ip}");
+    }
+
+    #[test]
+    fn resolve_host_rejects_gibberish() {
+        // A hostname that cannot possibly exist should yield an error.
+        let result = resolve_host("this.hostname.does.not.exist.invalid");
+        assert!(result.is_err(), "expected resolution failure for nonexistent hostname");
     }
 }

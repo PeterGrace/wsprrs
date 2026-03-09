@@ -30,7 +30,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::io::IsTerminal as _;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{mpsc, Notify, RwLock};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -38,56 +39,78 @@ use tracing_subscriber::{prelude::*, EnvFilter, Registry};
 
 // ---- indicatif / tracing integration ----
 //
-// `tracing_subscriber::fmt` and `indicatif::MultiProgress` both write to
-// stderr directly.  When they interleave, raw terminal writes from tracing
-// corrupt the progress bar ANSI rendering.  We fix this by routing every
-// tracing log event through `MultiProgress::println`, which suspends the
-// bars, prints the line, then redraws — keeping the two in sync.
+// In interactive mode (stderr is a TTY) every tracing event is routed through
+// `MultiProgress::println`, which suspends the progress bars, prints the line,
+// then redraws — preventing raw terminal writes from corrupting ANSI rendering.
+//
+// In quiet mode (stderr is not a TTY, or WSPR_QUIET=1 is set) the
+// MultiProgress draw target is set to hidden so bar calls become no-ops, and
+// tracing events are written directly to stderr with ANSI codes disabled —
+// suitable for systemd / journald capture.
 
-/// A `MakeWriter` that routes each tracing event through indicatif's
-/// `MultiProgress::println` so log lines appear above progress bars cleanly.
-#[derive(Clone)]
-struct MultiProgressMakeWriter(Arc<MultiProgress>);
-
-/// Per-event writer produced by [`MultiProgressMakeWriter`].
+/// Unified `MakeWriter` for both interactive (TTY) and quiet (service) modes.
 ///
-/// Buffers all `write()` calls for one event, then emits a single
-/// `MultiProgress::println` call on [`Drop`].
-struct MultiProgressEventWriter {
+/// - **TTY mode**: buffers each event and flushes via `MultiProgress::println`
+///   so log lines interleave cleanly with live progress bars.
+/// - **Quiet mode**: writes directly to `stderr`; ANSI codes are disabled at
+///   the subscriber level so journald receives clean plain text.
+#[derive(Clone)]
+struct AppMakeWriter {
     multi: Arc<MultiProgress>,
-    buf: Vec<u8>,
+    quiet: bool,
 }
 
-impl std::io::Write for MultiProgressEventWriter {
+/// Per-event writer produced by [`AppMakeWriter`].
+enum AppWriter {
+    /// Buffers the event then emits via `MultiProgress::println` on drop.
+    Tty { multi: Arc<MultiProgress>, buf: Vec<u8> },
+    /// Writes directly to stderr.
+    Quiet(std::io::Stderr),
+}
+
+impl std::io::Write for AppWriter {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.buf.extend_from_slice(data);
-        Ok(data.len())
+        match self {
+            AppWriter::Tty { buf, .. } => {
+                buf.extend_from_slice(data);
+                Ok(data.len())
+            }
+            AppWriter::Quiet(w) => w.write(data),
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        if !self.buf.is_empty() {
-            // `MultiProgress::println` appends its own newline, so strip ours.
-            if let Ok(s) = std::str::from_utf8(&self.buf) {
-                let _ = self.multi.println(s.trim_end_matches('\n'));
+        match self {
+            AppWriter::Tty { multi, buf } => {
+                if !buf.is_empty() {
+                    if let Ok(s) = std::str::from_utf8(buf) {
+                        let _ = multi.println(s.trim_end_matches('\n'));
+                    }
+                    buf.clear();
+                }
+                Ok(())
             }
-            self.buf.clear();
+            AppWriter::Quiet(w) => w.flush(),
         }
-        Ok(())
     }
 }
 
-impl Drop for MultiProgressEventWriter {
+impl Drop for AppWriter {
     fn drop(&mut self) {
         use std::io::Write;
         let _ = self.flush();
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MultiProgressMakeWriter {
-    type Writer = MultiProgressEventWriter;
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AppMakeWriter {
+    type Writer = AppWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
-        MultiProgressEventWriter { multi: self.0.clone(), buf: Vec::new() }
+        if self.quiet {
+            AppWriter::Quiet(std::io::stderr())
+        } else {
+            AppWriter::Tty { multi: self.multi.clone(), buf: Vec::new() }
+        }
     }
 }
 
@@ -119,10 +142,23 @@ async fn main() -> Result<()> {
     // Load `.env` if present; ignore errors (file may not exist).
     let _ = dotenvy::dotenv();
 
-    // ---- indicatif MultiProgress (shared with buffer_task and tracing) ----
-    // Created here so the tracing writer can route through it before any
-    // progress bars are added; MultiProgress::println works fine with 0 bars.
-    let multi = Arc::new(MultiProgress::new());
+    // ---- quiet mode detection ----
+    //
+    // Quiet mode is active when stderr is not a TTY (e.g. running under
+    // systemd) OR when WSPR_QUIET=1 is set explicitly.  In quiet mode:
+    //   - Progress bars are hidden (draw target = hidden → all bar calls are
+    //     no-ops, so buffer_task needs no changes).
+    //   - Tracing events are written directly to stderr with ANSI codes
+    //     disabled so journald receives clean plain text.
+    let quiet = !std::io::stderr().is_terminal()
+        || std::env::var("WSPR_QUIET").map(|v| v == "1").unwrap_or(false);
+
+    // ---- indicatif MultiProgress ----
+    let multi = Arc::new(if quiet {
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+    } else {
+        MultiProgress::new()
+    });
 
     // ---- tracing / logging setup ----
     // console-subscriber enables `tokio-console` introspection.
@@ -134,10 +170,10 @@ async fn main() -> Result<()> {
                 .with_file(true)
                 .with_thread_ids(true)
                 .with_thread_names(true)
-                .with_line_number(true),
+                .with_line_number(true)
+                .with_ansi(!quiet), // no ANSI escape codes when writing to journald
         )
-        // Route through indicatif so log lines do not corrupt progress bars.
-        .with_writer(MultiProgressMakeWriter(multi.clone()))
+        .with_writer(AppMakeWriter { multi: multi.clone(), quiet })
         .with_span_events(FmtSpan::NONE);
 
     Registry::default()
