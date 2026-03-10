@@ -81,6 +81,22 @@ pub struct Config {
     ///
     /// Defaults to `wspr_wisdom.dat` in the current working directory.
     pub wisdom_file: PathBuf,
+
+    /// Optional ClickHouse HTTP endpoint (e.g. `http://localhost:8123`).
+    /// When `None`, ClickHouse insertion is disabled.
+    pub clickhouse_url: Option<String>,
+
+    /// ClickHouse database name.  Defaults to `"default"`.
+    pub clickhouse_db: String,
+
+    /// ClickHouse table name for spot rows.  Defaults to `"wspr_spots"`.
+    pub clickhouse_table: String,
+
+    /// Optional ClickHouse username.
+    pub clickhouse_user: Option<String>,
+
+    /// Optional ClickHouse password.  Store in `.env`; never log this value.
+    pub clickhouse_password: Option<String>,
 }
 
 impl Config {
@@ -91,14 +107,19 @@ impl Config {
     /// * `WSPR_MULTICAST_PORT`  — UDP port for the RTP data stream
     ///
     /// # Optional variables
-    /// * `WSPR_STATUS_PORT`     — UDP port for the status stream (default `5006`)
-    /// * `WSPR_LOCAL_ADDR`      — interface address (default `0.0.0.0`)
-    /// * `WSPR_SSRC`            — hex SSRC filter (default: all stereo-IQ SSRCs)
-    /// * `WSPR_CAPTURE_SECONDS` — capture window length in seconds (default `116`)
-    /// * `WSPR_TEMP_DIR`        — temp file directory (default `/tmp`)
-    /// * `WSPR_WSPRD_PATH`      — path to `wsprd` binary (default `wsprd`)
-    /// * `WSPR_OUTPUT_FILE`     — path to NDJSON spot log (default: none)
-    /// * `WSPR_WISDOM_FILE`     — path to FFTW wisdom file (default `wspr_wisdom.dat`)
+    /// * `WSPR_STATUS_PORT`        — UDP port for the status stream (default `5006`)
+    /// * `WSPR_LOCAL_ADDR`         — interface address (default `0.0.0.0`)
+    /// * `WSPR_SSRC`               — hex SSRC filter (default: all stereo-IQ SSRCs)
+    /// * `WSPR_CAPTURE_SECONDS`    — capture window length in seconds (default `116`)
+    /// * `WSPR_TEMP_DIR`           — temp file directory (default `/tmp`)
+    /// * `WSPR_WSPRD_PATH`         — path to `wsprd` binary (default `wsprd`)
+    /// * `WSPR_OUTPUT_FILE`        — path to NDJSON spot log (default: none)
+    /// * `WSPR_WISDOM_FILE`        — path to FFTW wisdom file (default `wspr_wisdom.dat`)
+    /// * `WSPR_CLICKHOUSE_URL`     — ClickHouse HTTP endpoint (default: disabled)
+    /// * `WSPR_CLICKHOUSE_DB`      — ClickHouse database name (default `default`)
+    /// * `WSPR_CLICKHOUSE_TABLE`   — ClickHouse table name (default `wspr_spots`)
+    /// * `WSPR_CLICKHOUSE_USER`    — ClickHouse username (default: none)
+    /// * `WSPR_CLICKHOUSE_PASSWORD`— ClickHouse password; store in `.env` (default: none)
     ///
     /// # Errors
     ///
@@ -152,6 +173,14 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("wspr_wisdom.dat"));
 
+        let clickhouse_url = std::env::var("WSPR_CLICKHOUSE_URL").ok();
+        let clickhouse_db = std::env::var("WSPR_CLICKHOUSE_DB")
+            .unwrap_or_else(|_| "default".to_string());
+        let clickhouse_table = std::env::var("WSPR_CLICKHOUSE_TABLE")
+            .unwrap_or_else(|_| "wspr_spots".to_string());
+        let clickhouse_user = std::env::var("WSPR_CLICKHOUSE_USER").ok();
+        let clickhouse_password = std::env::var("WSPR_CLICKHOUSE_PASSWORD").ok();
+
         Ok(Self {
             multicast_addr,
             multicast_port,
@@ -163,6 +192,11 @@ impl Config {
             wsprd_path,
             output_file,
             wisdom_file,
+            clickhouse_url,
+            clickhouse_db,
+            clickhouse_table,
+            clickhouse_user,
+            clickhouse_password,
         })
     }
 
@@ -204,6 +238,11 @@ mod tests {
             "WSPR_WSPRD_PATH",
             "WSPR_OUTPUT_FILE",
             "WSPR_WISDOM_FILE",
+            "WSPR_CLICKHOUSE_URL",
+            "WSPR_CLICKHOUSE_DB",
+            "WSPR_CLICKHOUSE_TABLE",
+            "WSPR_CLICKHOUSE_USER",
+            "WSPR_CLICKHOUSE_PASSWORD",
         ] {
             std::env::remove_var(name);
         }

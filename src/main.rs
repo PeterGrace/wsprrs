@@ -128,7 +128,7 @@ use config::Config;
 use error::WsprError;
 use multicast::ReceivedPacket;
 use rtp::parse_rtp_packet;
-use spot::WsprSpot;
+use spot::{WsprSpot, WsprSpotRow};
 use status::ChannelInfo;
 
 /// Channel capacity for raw UDP datagrams (receive → buffer task).
@@ -253,7 +253,25 @@ async fn main() -> Result<()> {
         multi,
         buf_shutdown,
     ));
-    let dec_handle = tokio::spawn(decode_task(win_rx, cfg.clone(), dec_shutdown));
+    // Build an optional ClickHouse client if WSPR_CLICKHOUSE_URL is configured.
+    let ch_client: Option<clickhouse::Client> = if let Some(url) = cfg.clickhouse_url.as_deref() {
+        let mut c = clickhouse::Client::default()
+            .with_url(url)
+            .with_database(&cfg.clickhouse_db);
+        if let Some(user) = &cfg.clickhouse_user {
+            c = c.with_user(user);
+        }
+        if let Some(password) = &cfg.clickhouse_password {
+            c = c.with_password(password);
+        }
+        tracing::info!(url, db = %cfg.clickhouse_db, table = %cfg.clickhouse_table, "ClickHouse output enabled");
+        ensure_ch_table(&c, &cfg.clickhouse_table).await;
+        Some(c)
+    } else {
+        None
+    };
+
+    let dec_handle = tokio::spawn(decode_task(win_rx, cfg.clone(), ch_client, dec_shutdown));
 
     // Wait for all four tasks to complete (they each exit on shutdown).
     let (r1, r2, r3, r4) = tokio::join!(recv_handle, status_handle, buf_handle, dec_handle);
@@ -557,12 +575,15 @@ async fn decode_window(window: AudioWindow, cfg: &Config) -> Result<Vec<WsprSpot
 ///
 /// # Arguments
 ///
-/// * `win_rx`  — receiver for sealed windows from the buffer task
-/// * `cfg`     — shared runtime configuration
-/// * `shutdown`— shared `Notify`; when triggered this function returns
+/// * `win_rx`   — receiver for sealed windows from the buffer task
+/// * `cfg`      — shared runtime configuration
+/// * `ch_client`— optional ClickHouse client; when `Some`, spots are inserted
+///   into `cfg.clickhouse_table` after each window decodes
+/// * `shutdown` — shared `Notify`; when triggered this function returns
 async fn decode_task(
     mut win_rx: mpsc::Receiver<(AudioWindow, Arc<Config>)>,
     cfg: Arc<Config>,
+    ch_client: Option<clickhouse::Client>,
     shutdown: Arc<Notify>,
 ) {
     // Open the output file once for the lifetime of this task (append + create).
@@ -588,10 +609,12 @@ async fn decode_task(
             }
         };
 
-    // Each per-window spawn sends its Vec<WsprSpot> result here so file I/O
-    // stays serialised in this task.  Unbounded is safe: at most one entry per
-    // SSRC per 2-minute window (typically < 30 concurrent decodes).
-    let (spot_tx, mut spot_rx) = mpsc::unbounded_channel::<Result<Vec<WsprSpot>>>();
+    // Each per-window spawn sends its (Vec<WsprSpot>, window_start) result
+    // here so file I/O stays serialised in this task.  window_start is needed
+    // to build WsprSpotRow for ClickHouse.  Unbounded is safe: at most one
+    // entry per SSRC per 2-minute window (typically < 30 concurrent decodes).
+    let (spot_tx, mut spot_rx) =
+        mpsc::unbounded_channel::<Result<(Vec<WsprSpot>, std::time::SystemTime)>>();
 
     loop {
         tokio::select! {
@@ -608,10 +631,14 @@ async fn decode_task(
                     None    => { tracing::info!("window channel closed"); break; }
                 };
                 let tx = spot_tx.clone();
+                // Capture window_start before moving `window` into the async block.
+                let window_start = window.window_start;
                 // Spawn an independent task per window — all bands decode in
                 // parallel, letting the next capture cycle start immediately.
                 tokio::spawn(async move {
-                    let result = decode_window(window, &win_cfg).await;
+                    let result = decode_window(window, &win_cfg)
+                        .await
+                        .map(|spots| (spots, window_start));
                     // Ignore send failure: decode_task may have exited on shutdown.
                     let _ = tx.send(result);
                 });
@@ -622,13 +649,16 @@ async fn decode_task(
                 // cannot happen while `spot_tx` is still live in this scope.
                 if let Some(result) = maybe_result {
                     match result {
-                        Ok(spots) => {
+                        Ok((spots, window_start)) => {
                             if spots.is_empty() {
                                 tracing::info!("wsprd: no spots decoded in this window");
                             }
                             for spot in &spots {
                                 log_spot(spot);
                                 write_spot(spot, &mut out_file).await;
+                            }
+                            if let Some(ref client) = ch_client {
+                                insert_spots_ch(client, &cfg.clickhouse_table, &spots, window_start).await;
                             }
                         }
                         Err(e) => {
@@ -651,6 +681,88 @@ fn log_spot(spot: &WsprSpot) {
     match serde_json::to_string(spot) {
         Ok(json) => tracing::info!(spot = %json, "WSPR spot decoded"),
         Err(e) => tracing::error!(error = %e, "failed to serialise spot"),
+    }
+}
+
+/// Create the WSPR spots table in ClickHouse if it does not already exist.
+///
+/// Uses `CREATE TABLE IF NOT EXISTS` so this is safe to call on every startup
+/// whether or not the table was previously created.  Errors are logged; a
+/// failure here does not abort startup — spots will fail to insert later and
+/// those errors will surface at that point.
+///
+/// # Arguments
+///
+/// * `client` — ClickHouse HTTP client
+/// * `table`  — table name to create
+async fn ensure_ch_table(client: &clickhouse::Client, table: &str) {
+    let ddl = format!(
+        "CREATE TABLE IF NOT EXISTS `{table}` (
+            window_start_unix Int64,
+            time_utc          String,
+            snr_db            Int32,
+            dt_sec            Float32,
+            freq_hz           Float64,
+            message           String,
+            callsign          String,
+            grid              String,
+            power_dbm         Int32,
+            drift             Int32,
+            sync_quality      Float32,
+            npass             UInt8,
+            osd_pass          UInt8,
+            nhardmin          Int32,
+            decode_cycles     UInt32,
+            candidates        UInt32,
+            nfano             Int32
+        ) ENGINE = MergeTree()
+        ORDER BY (window_start_unix, callsign)"
+    );
+    match client.query(&ddl).execute().await {
+        Ok(()) => tracing::info!(table, "ClickHouse table ready"),
+        Err(e) => tracing::error!(error = %e, table, "failed to create ClickHouse table"),
+    }
+}
+
+/// Insert a batch of decoded spots into ClickHouse as a single `INSERT`.
+///
+/// Converts each [`WsprSpot`] to a [`WsprSpotRow`] (adding `window_start_unix`),
+/// then writes the entire batch in one HTTP round-trip using the RowBinary
+/// protocol.  Errors are logged as warnings and do not abort the decode pipeline.
+///
+/// # Arguments
+///
+/// * `client`       — ClickHouse HTTP client
+/// * `table`        — target table name
+/// * `spots`        — decoded spots for this window
+/// * `window_start` — WSPR window boundary; used to derive `window_start_unix`
+async fn insert_spots_ch(
+    client: &clickhouse::Client,
+    table: &str,
+    spots: &[WsprSpot],
+    window_start: std::time::SystemTime,
+) {
+    if spots.is_empty() {
+        return;
+    }
+    let mut insert = match client.insert::<WsprSpotRow>(table) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::error!(error = %e, table, "failed to create ClickHouse inserter");
+            return;
+        }
+    };
+    for spot in spots {
+        let row = WsprSpotRow::from_spot(spot, window_start);
+        if let Err(e) = insert.write(&row).await {
+            tracing::error!(error = %e, "failed to write spot row to ClickHouse inserter");
+            return;
+        }
+    }
+    if let Err(e) = insert.end().await {
+        tracing::error!(error = %e, table, "failed to commit ClickHouse insert");
+    } else {
+        tracing::debug!(count = spots.len(), table, "inserted spots into ClickHouse");
     }
 }
 
