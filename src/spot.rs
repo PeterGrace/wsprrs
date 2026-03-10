@@ -19,6 +19,9 @@ pub struct WsprSpot {
     /// Full decoded message string (e.g. `"K1ABC FN42 33"`).
     pub message: String,
 
+    /// Callsign (e.g. `"K1ABC"`).
+    pub callsign: String,
+
     /// Maidenhead grid locator (4 or 6 characters; empty for type-2 messages
     /// that carry only callsign and power with no grid square).
     pub grid: String,
